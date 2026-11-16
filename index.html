@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<meta name="theme-color" content="#111111">
+<title>Knowledge Quest</title>
+<style>
+  /* Phone "game console": big colour + shape + letter buttons, very few words (works for limited English). */
+  :root { --gold:#d4af37; --bg:#1b1b1b; --A:#e2412f; --B:#2f7fd6; --C:#22a557; --D:#e8b923; --ok:#2ecc71; --bad:#e74c3c; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:#fff; font-family:Arial, Helvetica, sans-serif; }
+  body { display:flex; flex-direction:column; min-height:100vh; min-height:100dvh; user-select:none; -webkit-user-select:none; touch-action:manipulation; }
+  header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; background:#111; border-bottom:3px solid var(--gold); }
+  #name { font-size:22px; font-weight:bold; color:var(--gold); }
+  #meta { font-size:18px; color:#ccc; text-align:right; }
+  #status { text-align:center; padding:10px 12px 4px; min-height:84px; }
+  #big { font-size:44px; font-weight:900; line-height:1.1; }
+  #small { font-size:18px; color:#ccc; margin-top:4px; }
+  #clock { font-size:56px; font-weight:900; color:var(--gold); }
+  #clock.low { color:var(--bad); }
+  #pad { flex:1; display:grid; grid-template-columns:1fr 1fr; grid-auto-rows:1fr; gap:12px; padding:12px; }
+  #pad.tf { grid-template-columns:1fr; }
+  .btn { border:0; border-radius:18px; color:#fff; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:8px; font-family:inherit; min-height:110px; touch-action:manipulation; transition:transform .06s; }
+  .btn:active { transform:scale(.97); }
+  .btn .L { font-size:64px; font-weight:900; line-height:1; }
+  .btn .sh { font-size:26px; opacity:.85; }
+  .btn .t { font-size:13px; line-height:1.2; margin-top:6px; max-height:4.8em; overflow:hidden; opacity:.95; }
+  .btn.A { background:var(--A); } .btn.B { background:var(--B); } .btn.C { background:var(--C); } .btn.D { background:var(--D); color:#1a1a1a; }
+  .tf .btn .t { font-size:26px; font-weight:bold; }
+  .btn:disabled { opacity:.25; }
+  .btn.mine { opacity:1 !important; outline:6px solid #fff; }
+  .btn.correct { opacity:1 !important; box-shadow:0 0 0 6px var(--ok) inset; }
+  .msg { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; padding:20px; }
+  .emoji { font-size:96px; line-height:1.1; }
+  .hidden { display:none !important; }
+  #net { position:fixed; right:8px; bottom:6px; font-size:11px; color:#666; }
+  #net.bad { color:#f39c12; font-size:14px; }
+</style>
+</head>
+<body>
+  <header><div id="name">Knowledge Quest</div><div id="meta"></div></header>
+  <div id="status"><div id="big"></div><div id="small"></div></div>
+  <div id="pad" class="hidden"></div>
+  <div id="msg" class="msg"><div class="emoji">⏳</div></div>
+  <div id="net"></div>
+
+<script>
+/* ---------------------------------------------------------------------------------------------
+ * Knowledge Quest phone page.
+ *  - Static copy (GitHub Pages / any static host): talks to the Apps Script web app's JSON API
+ *    with fetch(), NO cookies (credentials:'omit'), so phones signed into several Google
+ *    accounts never hit "Sorry, unable to open the file at this time".
+ *  - The same code is pasted into Player.html (served by Apps Script) as a fallback; there
+ *    window.KQ_CFG.gsr = true and it uses google.script.run instead of fetch.
+ * Link format: <page>?g=GAME_ID&p=TOKEN   (old ?game= also accepted)
+ * ------------------------------------------------------------------------------------------- */
+var CFG = window.KQ_CFG || {};
+var API = CFG.api || 'https://script.google.com/macros/s/AKfycbz36ddOcS3KP73n4cmADfYGx4qpW9B0I6gp1qSoa_ckTvrhjhR7mbjIplKZdUmV4q4uug/exec';
+var qp = (function () {
+  var o = {}, src = (location.search || '').replace(/^\?/, '') + '&' + (location.hash || '').replace(/^#/, '');
+  src.split('&').forEach(function (kv) { if (!kv) return; var i = kv.indexOf('='); var k = decodeURIComponent(i < 0 ? kv : kv.slice(0, i)); var v = i < 0 ? '' : decodeURIComponent(kv.slice(i + 1).replace(/\+/g, ' ')); if (!(k in o)) o[k] = v; });
+  return o;
+})();
+var GAME_ID = CFG.game || qp.g || qp.game || '';
+var TOKEN = CFG.token || qp.p || '';
+var GRACE_MS = 1500;
+var SHAPES = { A:'▲', B:'◆', C:'●', D:'■' };
+var S = null, rev = -1, joined = false, localDeadline = 0, sent = {}, acked = {}, padKey = '';
+var inflight = false, inflightAt = 0, timer = 0, failures = 0, lastOkAt = 0, rtts = [];
+var $ = function (id) { return document.getElementById(id); };
+var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); };
+
+/* ---------- transport: fetch (static page) or google.script.run (Apps Script fallback) ---------- */
+var CALL_TIMEOUT_MS = 6000;   // abort a stuck request so a 40 s server hang never freezes the phone
+function call(params, timeoutMs) {
+  timeoutMs = timeoutMs || CALL_TIMEOUT_MS;
+  return oneCall(params, timeoutMs).catch(function (e) {
+    // Retry the same request right away once (answers are idempotent on the server).
+    return oneCall(params, timeoutMs);
+  });
+}
+function oneCall(params, timeoutMs) {
+  if (CFG.gsr && window.google && google.script && google.script.run) {
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var t = setTimeout(function () { if (!done) { done = true; reject(new Error('timeout')); } }, timeoutMs);
+      var r = google.script.run
+        .withSuccessHandler(function (x) { if (done) return; done = true; clearTimeout(t); resolve(x); })
+        .withFailureHandler(function (e) { if (done) return; done = true; clearTimeout(t); reject(e); });
+      if (params.api === 'answer') r.playerAnswer(GAME_ID, TOKEN, params.q, params.l);
+      else r.playerState(GAME_ID, TOKEN, params.join === '1');
+    });
+  }
+  var qs = ['api=' + encodeURIComponent(params.api), 'g=' + encodeURIComponent(GAME_ID), 'p=' + encodeURIComponent(TOKEN)];
+  Object.keys(params).forEach(function (k) { if (k !== 'api') qs.push(encodeURIComponent(k) + '=' + encodeURIComponent(params[k])); });
+  qs.push('_=' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  // Simple GET, no custom headers → no CORS preflight; no cookies → no Google multi-account confusion.
+  return new Promise(function (resolve, reject) {
+    var ctl = window.AbortController ? new AbortController() : null;
+    var settled = false;
+    var t = setTimeout(function () {
+      if (settled) return;
+      if (ctl) try { ctl.abort(); } catch (e) {}
+      settled = true;
+      reject(new Error('timeout'));
+    }, timeoutMs);
+    fetch(API + '?' + qs.join('&'), { method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'follow', referrerPolicy: 'no-referrer', signal: ctl ? ctl.signal : undefined })
+      .then(function (res) { if (!res.ok) throw new Error('HTTP ' + res.status); return res.json(); })
+      .then(function (j) { if (!settled) { settled = true; clearTimeout(t); resolve(j); } })
+      .catch(function (e) { if (!settled) { settled = true; clearTimeout(t); reject(e); } });
+  });
+}
+
+/* ---------- polling: fast while a question is being read / open, slower otherwise, backoff on errors ---------- */
+function nextDelay() {
+  if (document.hidden) return 3000;
+  if (!S) return 800;
+  if (S.status === 'reading') return 150;                 // catch the moment the clock opens
+  if (S.status === 'open') return (sent[S.q] || S.myAnswer) ? 700 : 300;
+  if (S.status === 'revealed') return 600;                 // next question can start any moment
+  if (S.status === 'final') return 6000;
+  return 1000;                                             // lobby
+}
+function schedule(ms) { clearTimeout(timer); timer = setTimeout(poll, ms); }
+function poll() {
+  if (!GAME_ID || !TOKEN) return show('⚠️', 'Link not valid', 'Ask for a new QR code');
+  if (inflight && Date.now() - inflightAt < CALL_TIMEOUT_MS) return;  // a stuck request never blocks polling past the client timeout
+  inflight = true; inflightAt = Date.now();
+  var t0 = Date.now(), mine = inflightAt;
+  call({ api: 'state', join: joined ? '' : '1' }).then(function (st) {
+    if (mine !== inflightAt) return;                       // superseded by a newer poll
+    inflight = false; failures = 0; lastOkAt = Date.now(); noteRtt(Date.now() - t0);
+    if (st && st.ok) joined = true;
+    onState(st);
+    schedule(nextDelay());
+  }).catch(function () {
+    if (mine !== inflightAt) return;
+    inflight = false; failures++;
+    net();
+    // First failure: retry immediately. Further failures back off, but stay short.
+    schedule(failures <= 1 ? 0 : Math.min(2000, 250 * Math.pow(2, Math.min(failures - 1, 3))));
+  });
+}
+function pollNow() { inflight = false; schedule(0); }
+function noteRtt(ms) { rtts.push(ms); if (rtts.length > 20) rtts.shift(); net(); try { if (window.console) console.log('[KQ] rtt ' + ms + ' ms'); } catch (e) {} }
+function net() {
+  var el = $('net'); if (!el) return;
+  var stale = !lastOkAt || Date.now() - lastOkAt > 4000;
+  if (failures && stale) { el.className = 'bad'; el.textContent = '📶 reconnecting…'; return; }
+  var avg = rtts.length ? rtts.reduce(function (a, b) { return a + b; }, 0) / rtts.length : 0;
+  el.className = ''; el.textContent = avg ? '⚡ ' + (avg / 1000).toFixed(1) + ' s' : '';
+}
+// Coming back to the page (screen woke up, app switched, network back) → resync immediately, never needs a refresh.
+document.addEventListener('visibilitychange', function () { if (!document.hidden) pollNow(); });
+window.addEventListener('focus', pollNow);
+window.addEventListener('online', pollNow);
+window.addEventListener('pageshow', pollNow);
+setInterval(function () { if (lastOkAt && Date.now() - lastOkAt > 6000) { net(); pollNow(); } }, 2000);   // watchdog
+
+/* ---------- rendering ---------- */
+function show(emoji, big, small) {
+  $('pad').classList.add('hidden'); $('msg').classList.remove('hidden');
+  $('msg').innerHTML = '<div class="emoji">' + emoji + '</div>';
+  $('big').innerHTML = big || ''; $('small').innerHTML = small || '';
+  padKey = '';
+}
+function onState(st) {
+  if (!st || !st.ok) {
+    if (st && st.error === 'no-game') return show('📺', 'No game right now', 'Watch the TV');
+    return show('⚠️', 'Link not valid', 'Ask for a new QR code');
+  }
+  if (typeof st.rev === 'number') { if (st.rev < rev && rev - st.rev < 5) return; rev = st.rev; }   // ignore an older reply that arrived late
+  S = st;
+  if (st.deadline) localDeadline = Date.now() + (st.deadline - st.serverNow);
+  render();
+}
+function render() {
+  var st = S; if (!st) return;
+  $('name').textContent = st.name;
+  $('meta').innerHTML = (st.status === 'lobby' ? '' : 'Q ' + (st.q + 1) + '/' + st.total + '<br>') + '⭐ ' + Number(st.myPoints).toFixed(1);
+  if (st.status === 'lobby') return show('👋', 'Ready!', 'Watch the TV 📺');
+  if (st.status === 'final') {
+    var f = st.final || {};
+    return show(f.won ? '🏆' : (f.tie ? '🤝' : '👏'), '⭐ ' + Number(st.myPoints).toFixed(1), '✅ ' + st.myCorrect + ' / ' + st.total + '<br>Thank you!');
+  }
+  drawPad(st);
+  if (st.status === 'reading') { $('big').innerHTML = '👂'; $('small').textContent = 'Listen…'; }
+  else if (st.status === 'open') {
+    var mine = st.myAnswer || sent[st.q];
+    if (mine === '⌛') { $('big').innerHTML = '⌛'; $('small').textContent = 'Too late'; }
+    else if (mine) { $('big').innerHTML = '🔒 ' + mine; $('small').textContent = (st.myAnswer || acked[st.q]) ? '✓ Locked in' : 'Sending…'; }
+    else { $('big').innerHTML = '<span id="clock"></span>'; $('small').textContent = 'GO! 👆'; tick(); }
+  } else if (st.status === 'revealed') {
+    var r = st.result || {};
+    $('big').innerHTML = r.correct ? '<span style="color:var(--ok)">✅ +' + Number(r.points).toFixed(1) + '</span>' : '<span style="color:var(--bad)">❌ 0</span>';
+    $('small').innerHTML = r.letter ? ('You: ' + r.letter + (r.seconds != null ? ' · ' + Number(r.seconds).toFixed(1) + ' s' : '')) : 'No answer';
+  }
+}
+function drawPad(st) {
+  var o = st.options || {};
+  var tf = o.type === 'TF' || (o.a === 'True' && o.b === 'False' && !o.c);
+  var letters = tf ? ['A', 'B'] : ['A', 'B', 'C', 'D'];
+  var mine = st.myAnswer || sent[st.q] || '';
+  var key = st.q + ':' + st.status + ':' + mine + ':' + (st.correct || '');
+  $('msg').classList.add('hidden'); $('pad').classList.remove('hidden');
+  if (key === padKey) return;
+  padKey = key;
+  var pad = $('pad'); pad.className = tf ? 'tf' : '';
+  pad.innerHTML = letters.map(function (L) {
+    var cls = 'btn ' + L + (mine === L ? ' mine' : '') + (st.status === 'revealed' && st.correct === L ? ' correct' : '');
+    var dis = st.status !== 'open' || !!mine;
+    return '<button class="' + cls + '" data-l="' + L + '" ' + (dis ? 'disabled' : '') + '>' +
+      '<div class="L">' + L + '</div><div class="sh">' + SHAPES[L] + '</div><div class="t">' + esc(o[L.toLowerCase()]) + '</div></button>';
+  }).join('');
+}
+// pointerdown answers on first touch (no click delay); click is the fallback for older phones.
+function padHandler(e) {
+  var b = e.target && e.target.closest ? e.target.closest('button[data-l]') : null;
+  if (!b || b.disabled) return;
+  if (e.type === 'pointerdown') { e.preventDefault(); padHandler.lastPD = Date.now(); }
+  else if (padHandler.lastPD && Date.now() - padHandler.lastPD < 800) return;
+  answer(b.getAttribute('data-l'));
+}
+$('pad').addEventListener('pointerdown', padHandler);
+$('pad').addEventListener('click', padHandler);
+
+/* ---------- answering: lock instantly on the phone, then send until the server acknowledges ---------- */
+function answer(L) {
+  if (!S || S.status !== 'open' || sent[S.q] || S.myAnswer) return;
+  var q = S.q;
+  sent[q] = L;
+  if (navigator.vibrate) try { navigator.vibrate(60); } catch (e) {}
+  render();
+  sendAnswer(q, L, 0);
+}
+function sendAnswer(q, L, n) {
+  // Same letter every time: the server treats a retried answer as idempotent ('already').
+  call({ api: 'answer', q: q, l: L }).then(function (r) {
+    if (r && r.ok) { acked[q] = true; }
+    else if (r && r.error === 'already') { sent[q] = r.letter || L; acked[q] = true; }
+    else if (r && (r.error === 'late' || r.error === 'closed')) { if (!(S && S.myAnswer)) sent[q] = '⌛'; acked[q] = true; }
+    else if (r && r.error === 'bad-letter') { delete sent[q]; }
+    else return retry();
+    padKey = ''; if (S && S.q === q) render();
+    pollNow();
+  }).catch(retry);
+  function retry() {
+    // keep trying while the answer can still count (the server stamps the time when it first receives it)
+    if (Date.now() < localDeadline + GRACE_MS + 3000 && n < 15) setTimeout(function () { sendAnswer(q, L, n + 1); }, 0);
+    else { if (S && S.q === q && !S.myAnswer) { sent[q] = '⌛'; padKey = ''; render(); } }
+  }
+}
+function tick() {
+  var c = $('clock');
+  if (!c || !S || S.status !== 'open') return;
+  var left = Math.max(0, Math.ceil((localDeadline - Date.now()) / 1000));
+  c.textContent = left; c.className = left <= 5 ? 'low' : '';
+}
+try { if (navigator.wakeLock) navigator.wakeLock.request('screen').catch(function () {}); } catch (e) {}
+document.addEventListener('visibilitychange', function () { try { if (!document.hidden && navigator.wakeLock) navigator.wakeLock.request('screen').catch(function () {}); } catch (e) {} });
+poll(); setInterval(tick, 200);
+</script>
+</body>
+</html>
